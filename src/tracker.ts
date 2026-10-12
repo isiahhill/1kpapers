@@ -88,9 +88,15 @@ export type TrackerFile<T> = {
 // models, and they are most of what trends right after a big release.
 const DERIVATIVE_RELATIONS = ["quantized", "adapter", "merge"] as const;
 
+// Uploaders label base_model relations by hand and often call a quantization a
+// "finetune", so the file format is the more honest signal for a repack.
+const QUANTIZED_FORMAT_TAGS = new Set(["gguf", "gptq", "awq", "exl2", "mlx"]);
+
 export function isDerivativeRepack(tags: string[] = []) {
-  return tags.some((tag) =>
-    DERIVATIVE_RELATIONS.some((relation) => tag.startsWith(`base_model:${relation}:`)),
+  return tags.some(
+    (tag) =>
+      QUANTIZED_FORMAT_TAGS.has(tag) ||
+      DERIVATIVE_RELATIONS.some((relation) => tag.startsWith(`base_model:${relation}:`)),
   );
 }
 

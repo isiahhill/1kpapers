@@ -162,3 +162,9 @@ test("a failure staging the second file leaves the previous pair byte-identical"
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("a GGUF upload self-labelled as a finetune is still a repack", () => {
+  assert.equal(isDerivativeRepack(["gguf", "base_model:finetune:Qwen/Qwen3-VL-8B-Instruct"]), true);
+  assert.equal(isDerivativeRepack(["mlx", "safetensors"]), true);
+  assert.equal(isDerivativeRepack(["safetensors", "base_model:finetune:Qwen/Qwen3-8B"]), false);
+});
