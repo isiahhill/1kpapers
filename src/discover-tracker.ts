@@ -16,18 +16,21 @@
 // The token is optional (the endpoints are public) but raises rate limits. It
 // is read from the environment only and never logged.
 
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
+  authHeaders,
   linkPapersToModels,
   mergeModels,
   mergePapers,
+  minimumItems,
   toTrackedModel,
   toTrackedPaper,
   TRACKED_PIPELINES,
   TRACKER_SCHEMA_VERSION,
   validateTrackerItems,
   windowStart,
+  writeFilesTogether,
   type HfModelRow,
   type TrackedModel,
   type TrackedPaper,
@@ -47,7 +50,8 @@ const paperLimit = positiveInt(args["paper-limit"] ?? "60", "paper-limit");
 const modelLimit = positiveInt(args["model-limit"] ?? "60", "model-limit");
 const outDir = path.resolve(args.out ?? "site/data/tracker");
 // Test hook for the failure path: point at a dead host and confirm the
-// previous files survive. Not meant for normal use.
+// previous files survive. Not meant for normal use, and the token is only
+// ever sent to huggingface.co (see authHeaders).
 const hubBase = args["hub-base"] ?? "https://huggingface.co";
 const token = process.env.HF_TOKEN?.trim() || null;
 
@@ -63,8 +67,8 @@ const linkedPapers = linkPapersToModels(papers, models);
 
 // Thresholds are deliberately low: a quiet week is fine, an empty one means
 // something broke upstream.
-const modelProblems = validateTrackerItems(models, 10, (model) => model.id);
-const paperProblems = validateTrackerItems(linkedPapers, 10, (paper) => paper.arxivId);
+const modelProblems = validateTrackerItems(models, minimumItems(10, modelLimit), (model) => model.id);
+const paperProblems = validateTrackerItems(linkedPapers, minimumItems(10, paperLimit), (paper) => paper.arxivId);
 if (modelProblems.length || paperProblems.length) {
   console.error(`Refusing to write tracker files; previous data kept.`);
   for (const problem of modelProblems) console.error(`  models: ${problem}`);
@@ -72,8 +76,16 @@ if (modelProblems.length || paperProblems.length) {
   process.exit(1);
 }
 
-await writeTrackerFile<TrackedModel>("models.json", "https://huggingface.co/api/models (trending, per pipeline)", modelDays, models);
-await writeTrackerFile<TrackedPaper>("papers.json", "https://huggingface.co/api/daily_papers", paperDays, linkedPapers);
+await mkdir(outDir, { recursive: true });
+await writeFilesTogether(
+  [
+    trackerFile<TrackedModel>("models.json", "https://huggingface.co/api/models (trending, per pipeline)", modelDays, models),
+    trackerFile<TrackedPaper>("papers.json", "https://huggingface.co/api/daily_papers", paperDays, linkedPapers),
+  ],
+  { writeFile: (file, data) => writeFile(file, data), rename, rm },
+  String(process.pid),
+);
+console.error(`  wrote models.json and papers.json in ${outDir}`);
 
 const newestModel = models.reduce((a, b) => (a.createdAt > b.createdAt ? a : b));
 const newestPaper = linkedPapers.reduce((a, b) => (a.publishedAt > b.publishedAt ? a : b));
@@ -120,7 +132,9 @@ async function fetchPapers() {
   return mergePapers(collected, paperLimit);
 }
 
-async function writeTrackerFile<T>(name: string, source: string, days: number, items: T[]) {
+// Builds one file's contents; writeFilesTogether stages and swaps the pair so
+// a reader never sees half a JSON file or a half-finished run.
+function trackerFile<T>(name: string, source: string, days: number, items: T[]) {
   const file: TrackerFile<T> = {
     schemaVersion: TRACKER_SCHEMA_VERSION,
     generatedAt,
@@ -129,14 +143,7 @@ async function writeTrackerFile<T>(name: string, source: string, days: number, i
     count: items.length,
     items,
   };
-  await mkdir(outDir, { recursive: true });
-  const target = path.join(outDir, name);
-  // Write-then-rename is atomic on one filesystem, so a reader (or a crash)
-  // never sees half a JSON file.
-  const temp = `${target}.${process.pid}.tmp`;
-  await writeFile(temp, `${JSON.stringify(file, null, 2)}\n`);
-  await rename(temp, target);
-  console.error(`  wrote ${target}`);
+  return { target: path.join(outDir, name), content: `${JSON.stringify(file, null, 2)}\n` };
 }
 
 async function fetchWithRetry(url: URL) {
@@ -146,7 +153,7 @@ async function fetchWithRetry(url: URL) {
       const response = await fetch(url, {
         headers: {
           "User-Agent": "1kpapers-tracker/0.1",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...authHeaders(url, token),
         },
         signal: AbortSignal.timeout(30_000),
       });

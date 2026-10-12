@@ -237,3 +237,47 @@ export function validateTrackerItems<T>(items: T[], minimum: number, keyOf: (ite
   if (duplicates.length) problems.push(`duplicate keys: ${[...new Set(duplicates)].slice(0, 5).join(", ")}`);
   return problems;
 }
+
+// Only the real Hub ever sees the token. --hub-base exists so the failure path
+// can be exercised against a dead or fake host, and a bearer token has no
+// business travelling there.
+export const HF_HUB_ORIGIN = "https://huggingface.co";
+
+export function authHeaders(url: URL, token: string | null): Record<string, string> {
+  return token && url.origin === HF_HUB_ORIGIN ? { Authorization: `Bearer ${token}` } : {};
+}
+
+// The "thin run" floor can't exceed what was asked for: --model-limit=5 that
+// returns 5 good items is a success, not an empty week.
+export function minimumItems(floor: number, requested: number) {
+  return Math.min(floor, requested);
+}
+
+export type FileOps = {
+  writeFile: (file: string, data: string) => Promise<void>;
+  rename: (from: string, to: string) => Promise<void>;
+  rm: (file: string, options: { force: true }) => Promise<void>;
+};
+
+// models.json and papers.json are one generation, so we stage both before
+// touching either. A failure while staging deletes the temp files and leaves
+// the previous pair exactly as it was. What remains is the gap between the two
+// renames: a crash in that instant can still pair a new models.json with the
+// old papers.json. Closing it fully means a versioned directory plus a pointer
+// file, which felt like too much machinery for a cache readers rebuild weekly.
+export async function writeFilesTogether(files: Array<{ target: string; content: string }>, fs: FileOps, tag: string) {
+  const staged = files.map((file) => ({ ...file, temp: `${file.target}.${tag}.tmp` }));
+  try {
+    for (const file of staged) await fs.writeFile(file.temp, file.content);
+  } catch (error) {
+    await Promise.all(staged.map((file) => fs.rm(file.temp, { force: true })));
+    throw error;
+  }
+  try {
+    for (const file of staged) await fs.rename(file.temp, file.target);
+  } finally {
+    // A rename that throws would otherwise leave its temp file behind; the ones
+    // already renamed are gone, so force-removing all of them is safe.
+    await Promise.all(staged.map((file) => fs.rm(file.temp, { force: true })));
+  }
+}

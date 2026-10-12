@@ -3,17 +3,24 @@
 // Papers rows collapse, and when the writer must refuse to overwrite.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   arxivIdsFromTags,
+  authHeaders,
   fineTunedFrom,
   isDerivativeRepack,
   linkPapersToModels,
   mergeModels,
   mergePapers,
+  minimumItems,
   toTrackedModel,
   toTrackedPaper,
   validateTrackerItems,
+  writeFilesTogether,
   type HfModelRow,
 } from "./tracker.js";
 
@@ -108,4 +115,50 @@ test("validator rejects thin or duplicated results so the writer keeps old data"
   assert.deepEqual(validateTrackerItems(["a", "b", "c"], 2, (x) => x), []);
   assert.match(validateTrackerItems(["a"], 2, (x) => x).join(), /only 1 items/);
   assert.match(validateTrackerItems(["a", "a", "b"], 2, (x) => x).join(), /duplicate keys: a/);
+});
+
+test("the token only goes to huggingface.co, never a custom --hub-base", () => {
+  assert.deepEqual(authHeaders(new URL("https://huggingface.co/api/models"), "secret"), { Authorization: "Bearer secret" });
+  assert.deepEqual(authHeaders(new URL("http://127.0.0.1:9/api/models"), "secret"), {});
+  assert.deepEqual(authHeaders(new URL("https://huggingface.co.evil.test/api/models"), "secret"), {});
+  assert.deepEqual(authHeaders(new URL("https://huggingface.co/api/models"), null), {});
+});
+
+test("a small requested limit lowers the thin-run floor instead of always failing", () => {
+  assert.equal(minimumItems(10, 60), 10);
+  assert.equal(minimumItems(10, 5), 5);
+  assert.deepEqual(validateTrackerItems(["a", "b", "c", "d", "e"], minimumItems(10, 5), (x) => x), []);
+  assert.match(validateTrackerItems(["a", "b", "c", "d"], minimumItems(10, 5), (x) => x).join(), /only 4 items/);
+});
+
+test("a failure staging the second file leaves the previous pair byte-identical", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "tracker-pair-"));
+  try {
+    const models = path.join(dir, "models.json");
+    const papers = path.join(dir, "papers.json");
+    await writeFile(models, "old models\n");
+    await writeFile(papers, "old papers\n");
+    const digest = async (file: string) => createHash("sha256").update(await readFile(file)).digest("hex");
+    const before = [await digest(models), await digest(papers)];
+
+    let writes = 0;
+    const failingWrite = async (file: string, data: string) => {
+      writes += 1;
+      if (writes === 2) throw new Error("disk full");
+      await writeFile(file, data);
+    };
+    await assert.rejects(
+      writeFilesTogether([{ target: models, content: "new models\n" }, { target: papers, content: "new papers\n" }], { writeFile: failingWrite, rename, rm }, "test"),
+      /disk full/,
+    );
+
+    assert.deepEqual([await digest(models), await digest(papers)], before);
+    assert.deepEqual((await readdir(dir)).sort(), ["models.json", "papers.json"]);
+
+    await writeFilesTogether([{ target: models, content: "new models\n" }, { target: papers, content: "new papers\n" }], { writeFile, rename, rm }, "test");
+    assert.equal(await readFile(models, "utf8"), "new models\n");
+    assert.equal(await readFile(papers, "utf8"), "new papers\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
